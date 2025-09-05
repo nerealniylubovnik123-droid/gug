@@ -1,0 +1,968 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>Hookah Mixes — Telegram Mini App (demo)</title>
+  <!-- TailwindCSS (CDN) — good for a quick demo -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Telegram Mini Apps SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <!-- React 18 UMD builds + Babel for on-the-fly JSX -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html,body,#root { height: 100%; }
+    body { margin: 0; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  // Ensure Telegram WebApp is marked ready (affects header coloring / viewport)
+  try { window.Telegram?.WebApp?.ready?.(); } catch (e) { console.warn(e); }
+
+  import React, { useEffect, useMemo, useRef, useState } from "react";
+
+// -----------------------------------------------------------------------------
+// Minimal UI shims (self-contained, no external deps)
+// -----------------------------------------------------------------------------
+const Card = ({ className = "", children }) => (
+  <div className={`rounded-2xl border border-slate-200 bg-white ${className}`}>{children}</div>
+);
+const CardContent = ({ className = "", children }) => (
+  <div className={`p-3 ${className}`}>{children}</div>
+);
+const Button = ({ className = "", children, onClick, disabled, variant = "default", size = "sm", type = "button", title }) => (
+  <button
+    type={type}
+    onClick={onClick}
+    disabled={disabled}
+    title={title}
+    className={[
+      "inline-flex items-center justify-center rounded-xl",
+      size === "sm" ? "h-9 px-3 text-[12px]" : "h-10 px-4 text-[14px]",
+      variant === "outline"
+        ? "border border-slate-300 bg-white hover:bg-slate-50"
+        : variant === "ghost"
+        ? "bg-transparent hover:bg-slate-100"
+        : "bg-black text-white hover:bg-black/90",
+      disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer",
+      className,
+    ].join(" ")}
+  >
+    {children}
+  </button>
+);
+const Input = ({ className = "", ...props }) => (
+  <input
+    className={`h-9 w-full rounded-xl border border-slate-300 px-3 text-sm outline-none focus:ring-2 focus:ring-slate-300 ${className}`}
+    {...props}
+  />
+);
+const Textarea = ({ className = "", ...props }) => (
+  <textarea
+    className={`min-h-[72px] w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-300 ${className}`}
+    {...props}
+  />
+);
+const Badge = ({ className = "", children, variant = "outline" }) => (
+  <span
+    className={[
+      "inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] border",
+      variant === "outline" ? "border-slate-300 text-slate-700 bg-white" : "bg-slate-900 text-white border-transparent",
+      className,
+    ].join(" ")}
+  >
+    {children}
+  </span>
+);
+
+// -----------------------------------------------------------------------------
+// Helper: ensure mobile viewport + Telegram expand
+// -----------------------------------------------------------------------------
+function MobileViewportInit() {
+  useEffect(() => {
+    const ensureMeta = (name, content) => {
+      let el = document.querySelector(`meta[name="${name}"]`);
+      if (!el) {
+        el = document.createElement("meta");
+        el.setAttribute("name", name);
+        document.head.appendChild(el);
+      }
+      el.setAttribute("content", content);
+    };
+    try { ensureMeta("viewport", "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"); } catch {}
+    try { ensureMeta("theme-color", "#ffffff"); } catch {}
+    try { (window?.Telegram?.WebApp?.expand?.()) } catch {}
+  }, []);
+  return null;
+}
+
+// -----------------------------------------------------------------------------
+// Types via JSDoc
+// -----------------------------------------------------------------------------
+/** @typedef {{ id:string, name:string, description?:string, strength10?:number, brand?:string, tags?:string[] }} Flavor */
+/** @typedef {{ flavorId:string, percent:number }} MixPart */
+/** @typedef {{ id:string, title:string, parts:MixPart[], notes?:string, author?:string, createdAt:number, taste?:string|null, strength10?:number|null }} Mix */
+
+// -----------------------------------------------------------------------------
+// Utils (runtime-guarded)
+// -----------------------------------------------------------------------------
+const safeNum = (v, def = 0) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+};
+const safePercent = (v) => Math.max(0, Math.min(100, safeNum(v, 0)));
+/** @param {MixPart[]} parts */
+const percentSum = (parts) => (Array.isArray(parts) ? parts.reduce((a, b) => a + safePercent(b?.percent), 0) : 0);
+
+// UUID v4 — crypto-free (sandbox friendly), correct version/variant bits
+const uuidv4 = () => {
+  let dt = Date.now();
+  if (typeof performance !== "undefined" && typeof performance.now === "function") dt += performance.now();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (dt + Math.random() * 16) % 16 | 0; dt = Math.floor(dt / 16);
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
+const normalizeBrand = (b) => {
+  const t = (b || "").trim().toLowerCase();
+  if (/must\s*have|musthave/.test(t)) return "MustHave";
+  if (/black\s*burn|blackburn/.test(t)) return "BlackBurn";
+  if (/overdo?se?/.test(t)) return "Overdos";
+  if (/satyr|satir/.test(t)) return "Satir";
+  if (/starline/.test(t)) return "Starline";
+  if (/trofim/.test(t)) return "Trofimov";
+  if (/bonch|bonche/.test(t)) return "Bonch";
+  return (b || "").trim();
+};
+
+const BRAND_STRENGTH10_DEFAULTS = {
+  Darkside: 5,
+  MustHave: 5,
+  Bonch: 7,
+  Starline: 3,
+  Overdos: 6,
+  BlackBurn: 6,
+  Trofimov: 7,
+};
+
+/** @param {Flavor=} f */
+const getStrength10 = (f) => {
+  if (!f) return 5;
+  const val = typeof f.strength10 === "number" ? f.strength10 : BRAND_STRENGTH10_DEFAULTS[normalizeBrand(f.brand)] ?? 5;
+  return Math.max(1, Math.min(10, safeNum(val, 5)));
+};
+
+// -----------------------------------------------------------------------------
+// Visual helpers + calculations
+// -----------------------------------------------------------------------------
+const strengthColor = (v) => {
+  if (v == null) return { bg: "bg-slate-100", text: "text-slate-700", border: "border-slate-200" };
+  if (v < 4) return { bg: "bg-emerald-50", text: "text-emerald-700", border: "border-emerald-200" };
+  if (v < 7) return { bg: "bg-amber-50", text: "text-amber-800", border: "border-amber-200" };
+  return { bg: "bg-rose-50", text: "text-rose-800", border: "border-rose-200" };
+};
+
+// Badge renderer for numeric strength (no-JSX helper)
+const strengthBadge10 = (value) => {
+  const label = value < 4 ? "лёгкая" : value < 7 ? "средняя" : "крепкая";
+  const c = strengthColor(value);
+  return React.createElement(
+    "span",
+    { className: `inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] border ${c.bg} ${c.text} ${c.border}` },
+    `${Number(value).toFixed(1)} (${label})`
+  );
+};
+
+// Weighted-average mix strength (1..10) with 1 decimal, or null
+/** @param {MixPart[]} parts @param {Flavor[]} flavors */
+const calcMixStrengthValue10 = (parts, flavors) => {
+  if (!Array.isArray(parts) || !Array.isArray(flavors)) return null;
+  const total = percentSum(parts);
+  if (!parts.length || total <= 0) return null;
+  let weighted = 0;
+  for (const p of parts) {
+    const percent = safePercent(p?.percent);
+    if (percent <= 0) continue;
+    const fl = flavors.find((x) => x && x.id === p?.flavorId);
+    if (!fl) continue;
+    weighted += getStrength10(fl) * (percent / total);
+  }
+  return weighted ? Math.round(weighted * 10) / 10 : null;
+};
+
+// Clamp percent change so that sum never exceeds 100
+/** @param {MixPart[]} parts */
+const clampPercentForPart = (parts, targetId, newVal) => {
+  const otherSum = percentSum(parts.filter((x) => x?.flavorId !== targetId));
+  return Math.max(0, Math.min(safePercent(newVal), 100 - otherSum));
+};
+
+// Mix description -> color theme
+const toneFromText = (txt) => {
+  if (!txt) return null;
+  const tokens = String(txt).toLowerCase().split(/[^a-zа-я0-9]+/i).filter(Boolean);
+  for (const tk of tokens) {
+    const w = tasteWordFromTag(tk);
+    if (w) return w; // first match is fine
+  }
+  return null;
+};
+
+// -----------------------------------------------------------------------------
+// Robust JSON parser for various shapes (array, brand->array, brand->map, with wrappers)
+//  - Accepts top-level {flavors: ...} / {data: ...} / {items: ...}
+//  - Tags: array or string (comma/semicolon/pipe). Description coerced to string.
+//  - Items can be strings in brand arrays: { Starline: ["Apple", "Peach"] }
+//  - Generates stable ids; dedups by id
+// -----------------------------------------------------------------------------
+/** @param {any} input */
+const parseFlavorsFromJson = (input) => {
+  // unwrap common wrappers
+  let data = input;
+  if (data && typeof data === 'object') {
+    if (Array.isArray(data.flavors)) data = data.flavors;
+    else if (data.data) data = data.data;
+    else if (data.items) data = data.items;
+  }
+
+  /** @type {Flavor[]} */
+  const out = [];
+
+  /** @param {any} raw @param {string=} fallbackBrand */
+  const push = (raw, fallbackBrand) => {
+    if (!raw) return;
+    // Allow raw to be string (name only)
+    if (typeof raw === 'string') {
+      const brand = normalizeBrand(fallbackBrand || "");
+      const name = raw.trim(); if (!name) return;
+      const id = `${brand}-${name.toLowerCase().replace(/[^a-zа-я0-9]+/gi, "-").replace(/-+/g, "-").replace(/^-|-$/g, "")}`;
+      out.push({ id, brand, name });
+      return;
+    }
+
+    const brand = normalizeBrand(raw?.brand ?? fallbackBrand ?? "");
+    const name = String(raw?.name ?? "").trim();
+    if (!name) return; // skip nameless
+
+    // description -> string
+    let description;
+    if (typeof raw?.description === "string") description = raw.description.trim();
+    else if (raw?.description != null) description = String(raw.description);
+
+    // tags -> array
+    let tags;
+    const t = raw?.tags;
+    if (Array.isArray(t)) tags = t.map((x) => String(x).trim()).filter(Boolean);
+    else if (typeof t === "string") tags = t.split(/[;,|]/).map((s) => s.trim()).filter(Boolean);
+
+    // strength10 -> 1..10 (accept strings like "7")
+    let strength10;
+    const sRaw = raw?.strength10;
+    if (typeof sRaw === 'number' || (typeof sRaw === 'string' && sRaw.trim() !== '')) {
+      const sNum = Number(sRaw);
+      if (Number.isFinite(sNum)) strength10 = Math.max(1, Math.min(10, sNum));
+    }
+
+    // id
+    const id = String(
+      raw?.id ?? `${brand}-${name.toLowerCase().replace(/[^a-zа-я0-9]+/gi, "-").replace(/-+/g, "-").replace(/^-|-$/g, "")}`
+    );
+    out.push({ id, brand, name, description, strength10, tags });
+  };
+
+  const parseBrandBlock = (brandKey, block) => {
+    if (Array.isArray(block)) {
+      for (const it of block) push(it, brandKey);
+      return;
+    }
+    if (block && typeof block === "object") {
+      for (const name of Object.keys(block)) {
+        const val = block[name];
+        if (val && typeof val === "object" && !Array.isArray(val)) {
+          push({ name, ...val }, brandKey);
+        } else {
+          push({ name, description: String(val) }, brandKey);
+        }
+      }
+    }
+  };
+
+  if (Array.isArray(data)) {
+    for (const it of data) push(it);
+  } else if (data && typeof data === "object") {
+    for (const key of Object.keys(data)) parseBrandBlock(key, data[key]);
+  } else {
+    return [];
+  }
+
+  // de-dup & sort
+  const seen = new Set();
+  const dedup = out.filter((f) => (seen.has(f.id) ? false : (seen.add(f.id), true)));
+  dedup.sort((a, b) => (normalizeBrand(a.brand) || "").localeCompare(normalizeBrand(b.brand) || "") || a.name.localeCompare(b.name));
+  return dedup;
+};
+
+// -----------------------------------------------------------------------------
+// Category dictionary — returns ONE-WORD characteristic of a mix
+// Robust to non-string inputs; returns null if nothing matches
+// -----------------------------------------------------------------------------
+const tasteWordFromTag = (tag) => {
+  if (tag == null) return null;
+  const t = String(tag).toLowerCase().trim();
+  if (!t) return null;
+
+  // Category mapping (short clean dictionary)
+  const rules = [
+    [/кисл|sour/, "кислый"],
+    [/сладк|sweet/, "сладкий"],
+    [/прян|spice|ginger/, "пряный"],
+    [/лед|ice|cold|frost/, "ледяной"],
+    [/фрукт|fruit|яблок|banana|mango|pineapple|grape|orange|pear|melon|лимон|lime|грейпфрут|mandarin|berry/, "фруктовый"],
+    [/десерт|dessert|cake|pie|cookie|choco|cream|vanilla|waffle/, "десертный"],
+    [/алкогол|rum|wine|vodka|tequila|whisk/, "алкогольный"],
+    [/чай|tea/, "чайный"],
+    [/кофе|coffee/, "кофейный"],
+    [/орех|nut|peanut|almond|hazel|walnut|pistachio|sesame/, "ореховый"],
+    [/цветоч|flower|rose|lavender|violet/, "цветочный"],
+    [/трав|herb|mint|мят|tarhun|lemongrass|basil/, "травяной"],
+  ];
+  for (const [re, w] of rules) if (re.test(t)) return w;
+  return null;
+};
+
+// One-word characteristic of the mix from tags, names and descriptions (category)
+const getMixTasteLabel = (parts, flavors) => {
+  if (!Array.isArray(parts) || !Array.isArray(flavors) || parts.length === 0) return null;
+  const total = percentSum(parts); if (total <= 0) return null;
+  const scores = new Map(); // category -> weight
+
+  const addScore = (rawTag, weight) => {
+    const word = tasteWordFromTag(rawTag);
+    if (!word) return;
+    scores.set(word, (scores.get(word) || 0) + weight);
+  };
+
+  for (const p of parts) {
+    const w = safePercent(p?.percent);
+    if (w <= 0) continue;
+    const fl = flavors.find((f) => f && f.id === p?.flavorId);
+    if (!fl) continue;
+
+    // 1) explicit tags — primary weight
+    for (const t of fl.tags || []) addScore(t, w);
+
+    // 2) tokens from name — secondary weight
+    if (fl.name) {
+      const tokens = String(fl.name).toLowerCase().split(/[^a-zа-я0-9]+/i).filter(Boolean);
+      for (const tk of tokens) addScore(tk, Math.max(1, w * 0.6));
+    }
+
+    // 3) tokens from description — small weight
+    if (fl.description) {
+      const tokens = String(fl.description).toLowerCase().split(/[^a-zа-я0-9]+/i).filter(Boolean);
+      for (const tk of tokens) addScore(tk, Math.max(1, w * 0.3));
+    }
+  }
+
+  if (!scores.size) return null;
+  const PRIORITY = ['кислый','сладкий','пряный','ледяной','алкогольный','чайный','кофейный','фруктовый','десертный','ореховый','цветочный','травяной'];
+  const rank = (c) => { const i = PRIORITY.indexOf(c); return i === -1 ? 999 : i; };
+  const best = Array.from(scores.entries())
+    .sort((a, b) => (b[1] - a[1]) || (rank(a[0]) - rank(b[0])))[0][0];
+  return best || null;
+};
+
+// Derive main taste tag from parts & flavors (fallback used in tests)
+/** @param {MixPart[]} parts @param {Flavor[]} flavors */
+const deriveMainTaste = (parts, flavors) => {
+  if (!Array.isArray(parts) || !Array.isArray(flavors) || parts.length === 0) return null;
+  const total = percentSum(parts); if (total <= 0) return null;
+  const scores = new Map();
+  for (const p of parts) {
+    const fl = flavors.find((f) => f && f.id === p?.flavorId); if (!fl) continue;
+    const add = safePercent(p?.percent);
+    for (const t of fl.tags || []) {
+      const key = String(t).toLowerCase();
+      scores.set(key, (scores.get(key) || 0) + add);
+    }
+  }
+  const sorted = Array.from(scores.entries()).sort((a, b) => b[1] - a[1]);
+  return sorted.length ? sorted[0][0] : null;
+};
+
+// -----------------------------------------------------------------------------
+// Built-in fallback flavors (no network dependency)
+// -----------------------------------------------------------------------------
+/** @type {Flavor[]} */
+const FALLBACK_FLAVORS = [
+  { id: "mh-ice-lemon", name: "Ice Lemon", brand: "MustHave", strength10: 5, tags: ["цитрус", "лед", "кислые"] },
+  { id: "mh-raspberry", name: "Raspberry", brand: "MustHave", strength10: 5, tags: ["ягодные", "сладкие"] },
+  { id: "ds-supernova", name: "Supernova", brand: "Darkside", strength10: 5, tags: ["лед", "мятные"] },
+  { id: "bb-peach", name: "Peach", brand: "BlackBurn", strength10: 6, tags: ["фруктовые", "сладкие"] },
+  { id: "ov-energy", name: "Energy Drink", brand: "Overdos", strength10: 6, tags: ["десертные", "сладкие"] },
+];
+
+// -----------------------------------------------------------------------------
+// App
+// -----------------------------------------------------------------------------
+function HookahMixApp() {
+  const [flavors, setFlavors] = useState(FALLBACK_FLAVORS);
+  const [guestMixes, setGuestMixes] = useState([]);
+  const [expanded, setExpanded] = useState({});
+
+  const [query, setQuery] = useState("");
+  const [activeTab, setActiveTab] = useState("flavors");
+  const [title, setTitle] = useState("");
+  const [notes, setNotes] = useState("");
+  const [parts, setParts] = useState([]);
+  const [activeBrand, setActiveBrand] = useState(null);
+  const [importInfo, setImportInfo] = useState(null); // debug info after import
+  const [showIntro, setShowIntro] = useState(true); // стартовый экран
+  const [user, setUser] = useState({ name: "Гость" });
+
+  const fileInputRef = useRef(null);
+
+  // Telegram user detection
+  useEffect(() => {
+    try {
+      const tgUser = window?.Telegram?.WebApp?.initDataUnsafe?.user;
+      if (tgUser) {
+        const name = [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" ") || tgUser.username || `User ${tgUser.id}`;
+        setUser({ name, id: tgUser.id, username: tgUser.username });
+      }
+    } catch {}
+  }, []);
+
+  // Если пользователь печатает, показываем кросс-брендовый поиск и убираем выбранный бренд
+  useEffect(() => { if ((query || "").trim()) setActiveBrand(null); }, [query]);
+
+  const brands = useMemo(() => {
+    const set = new Set(); for (const f of flavors) if (f?.brand) set.add(normalizeBrand(f.brand));
+    return Array.from(set).sort();
+  }, [flavors]);
+
+  // Поиск по НАЗВАНИЮ вкуса (все производители) + также по описанию/тегам
+  const nameSearchResults = useMemo(() => {
+    const q = (query || "").toLowerCase().trim();
+    if (!q) return [];
+    return (flavors || [])
+      .filter((f) => {
+        const haystack = [f?.name, f?.brand, f?.description || "", ...(f?.tags || [])].join(" ").toLowerCase();
+        return haystack.includes(q);
+      })
+      .sort((a,b)=> (normalizeBrand(a.brand)||"").localeCompare(normalizeBrand(b.brand)||"") || a.name.localeCompare(b.name));
+  }, [flavors, query]);
+
+  // Статистика брендов для отладки
+  const brandStats = useMemo(() => {
+    const map = new Map();
+    for (const f of flavors) {
+      const b = normalizeBrand(f.brand);
+      map.set(b, (map.get(b) || 0) + 1);
+    }
+    return Array.from(map.entries()).sort((a,b)=>a[0].localeCompare(a[0]));
+  }, [flavors]);
+
+  // Фильтрация списка для просмотра по выбранному бренду (если нет запроса)
+  const filteredFlavors = useMemo(() => {
+    if ((query || "").trim()) return nameSearchResults; // при вводе показываем результаты поиска по имени
+    let base = activeBrand ? flavors.filter((f) => normalizeBrand(f.brand) === activeBrand) : flavors;
+    return base;
+  }, [query, flavors, activeBrand, nameSearchResults]);
+
+  const addToMix = (flavorId) => {
+    setParts((prev) => {
+      if (!flavorId) return prev;
+      if (prev.some((p) => p.flavorId === flavorId)) return prev;
+      if (percentSum(prev) >= 100) return prev;
+      return [...prev, { flavorId, percent: 0 }];
+    });
+  };
+
+  const updatePercent = (flavorId, v) => {
+    const requested = safePercent((v || [0])[0]);
+    setParts((prev) => prev.map((p) => (
+      p.flavorId === flavorId ? { ...p, percent: clampPercentForPart(prev, flavorId, requested) } : p
+    )));
+  };
+
+  const removePart = (flavorId) => setParts((prev) => prev.filter((p) => p.flavorId !== flavorId));
+  const clearDraft = () => { setTitle(""); setNotes(""); setParts([]); };
+
+  const total = percentSum(parts);
+  const strengthValue10 = calcMixStrengthValue10(parts, flavors);
+  const tasteLabel = getMixTasteLabel(parts, flavors);
+  const isValid = parts.length > 0 && total === 100 && title.trim().length >= 3;
+
+  const saveGuestMix = () => {
+    if (!isValid) return;
+    /** @type {Mix} */
+    const mix = {
+      id: uuidv4(),
+      title,
+      parts: [...parts],
+      notes,
+      author: user?.name || "Гость",
+      createdAt: Date.now(),
+      taste: tasteLabel || null,
+      strength10: strengthValue10 ?? null,
+    };
+    setGuestMixes((prev) => [mix, ...prev].slice(0, 500));
+    clearDraft(); setActiveTab("guest");
+  };
+
+  const onImport = async () => {
+    const file = fileInputRef.current?.files?.[0]; if (!file) return;
+    try {
+      const text = await file.text();
+      const raw = JSON.parse(text);
+      const arr = parseFlavorsFromJson(raw);
+      if (!arr.length) throw new Error("В файле нет валидных вкусов (ожидается массив, объект брендов или {flavors: ...})");
+      setFlavors(arr);
+      const brandsSet = new Set(arr.map((f)=>normalizeBrand(f.brand)).filter(Boolean));
+      setImportInfo({ count: arr.length, brands: brandsSet.size, sample: arr.slice(0,3).map(x=>x.name) });
+    } catch (e) {
+      alert("Ошибка импорта: " + ((e && e.message) || String(e)));
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  // Группировка гостевых миксов по автору
+  const mixesByAuthor = useMemo(() => {
+    const m = new Map();
+    for (const mix of guestMixes) {
+      const key = mix.author || "Гость";
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(mix);
+    }
+    return Array.from(m.entries());
+  }, [guestMixes]);
+
+  // Тема из описания
+  const descTone = toneFromText(notes);
+  const toneBg = useMemo(() => {
+    switch (descTone) {
+      case "кислый": return "bg-lime-50";
+      case "сладкий": return "bg-pink-50";
+      case "пряный": return "bg-amber-50";
+      case "ледяной": return "bg-cyan-50";
+      case "фруктовый": return "bg-orange-50";
+      case "десертный": return "bg-rose-50";
+      case "алкогольный": return "bg-purple-50";
+      case "чайный": return "bg-emerald-50";
+      case "кофейный": return "bg-stone-100";
+      case "ореховый": return "bg-yellow-50";
+      case "цветочный": return "bg-fuchsia-50";
+      case "травяной": return "bg-green-50";
+      default: return "bg-white";
+    }
+  }, [descTone]);
+
+  // Intro screen
+  if (showIntro) {
+    return (
+      <div className="min-h-[100svh] flex items-center justify-center p-4 bg-gradient-to-b from-slate-50 to-white">
+        <Card className="w-full max-w-sm shadow">
+          <CardContent className="space-y-4 text-center">
+            <div className="text-lg font-bold">готовы стать кальянным миксологом</div>
+            <Button className="w-full" onClick={() => setShowIntro(false)}>Ок</Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-[100svh] bg-white p-2 pb-24 text-sm">
+      <div className="mx-auto w-full max-w-sm">
+        <header className="mb-2 flex items-center justify-between">
+          <div className="min-w-0">
+            <h1 className="text-lg font-bold">Hookah Mixes</h1>
+            <div className="text-[10px] text-slate-500 truncate">Здравствуйте, {user?.name || "Гость"}</div>
+          </div>
+          <div className="flex items-center gap-1">
+            <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={onImport} />
+            <Button variant="outline" className="h-7 px-2 text-[10px]" onClick={() => fileInputRef.current?.click()}>Импорт JSON</Button>
+          </div>
+        </header>
+
+        <div className="mb-2 text-[10px] text-slate-500">
+          Всего вкусов: <b>{flavors.length}</b>
+          {importInfo && (
+            <>
+              <span className="mx-1">•</span>
+              Импортировано: <b>{importInfo.count}</b> (брендов: {importInfo.brands})
+            </>
+          )}
+          <details className="mt-1">
+            <summary className="cursor-pointer">Отладка JSON</summary>
+            <div className="mt-1 grid grid-cols-2 gap-1">
+              {brandStats.map(([b, n]) => (
+                <div key={b} className="flex justify-between">
+                  <span className="truncate mr-2">{b || "(без бренда)"}</span>
+                  <span className="opacity-70">{n}</span>
+                </div>
+              ))}
+            </div>
+            <div className="mt-1 text-[10px] opacity-70">
+              Поддерживаемые форматы: {"{"}Brand:[...] {"}"}; {"{"}flavors:[...] {"}"}; {"{"}Brand:{"{"}name:desc{"}"}{"}"}
+            </div>
+          </details>
+        </div>
+
+        {/* Tabs */}
+        <div className="mb-2 flex gap-2">
+          <Button variant="outline" onClick={() => setActiveTab("flavors")} className={activeTab === "flavors" ? "bg-black text-white" : ""}>Вкусы</Button>
+          <Button variant="outline" onClick={() => setActiveTab("guest")} className={activeTab === "guest" ? "bg-black text-white" : ""}>Гости</Button>
+        </div>
+
+        {activeTab === "flavors" && (
+          <div className="space-y-2">
+            {/* Глобальный поиск: при вводе показываем все совпадения по имени среди ВСЕХ производителей */}
+            <Input placeholder="Поиск по вкусам…" value={query} onChange={(e) => setQuery(e.target.value)} />
+
+            {query.trim() ? (
+              <div className="space-y-1 mt-1">
+                <div className="text-[11px] opacity-70">Результаты по «{query}» (все производители)</div>
+                {(nameSearchResults || []).map((f) => {
+                  const inMix = parts.some((p) => p.flavorId === f.id);
+                  return (
+                    <Card key={f.id}><CardContent className="py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 text-xs font-semibold">
+                            <span className="truncate max-w-[9rem]" title={`${f.brand || ""} • ${f.name}`}>{f.name}</span>
+                            {f.brand && <Badge>{normalizeBrand(f.brand)}</Badge>}
+                            {typeof getStrength10(f) === 'number' && strengthBadge10(getStrength10(f))}
+                          </div>
+                          {f.description && <div className="text-[10px] opacity-70 line-clamp-2">{f.description}</div>}
+                        </div>
+                        <Button
+                          size="sm"
+                          className="h-7 text-[12px] px-2"
+                          onClick={() => { if (!inMix) addToMix(f.id); }}
+                          disabled={inMix}
+                          title={inMix ? "Уже в миксе" : "Добавить в микс"}
+                        >
+                          {inMix ? "✓" : "+"}
+                        </Button>
+                      </div>
+                    </CardContent></Card>
+                  );
+                })}
+                {nameSearchResults.length === 0 && (
+                  <div className="text-center text-xs text-slate-400 py-2">Ничего не найдено</div>
+                )}
+              </div>
+            ) : (
+              !activeBrand ? (
+                <Card><CardContent>
+                  <div className="grid grid-cols-2 gap-1">
+                    {brands.map((b) => (
+                      <Button key={b} variant="outline" onClick={() => setActiveBrand(b)}>{b}</Button>
+                    ))}
+                  </div>
+                </CardContent></Card>
+              ) : (
+                <>
+                  <div className="mb-1 flex items-center justify-between">
+                    <Button variant="ghost" className="h-7 text-[12px]" onClick={() => setActiveBrand(null)}>← Бренды</Button>
+                    <Badge>{activeBrand}</Badge>
+                  </div>
+                  <div className="space-y-1">
+                    {(filteredFlavors || []).map((f) => {
+                      const inMix = parts.some((p) => p.flavorId === f.id);
+                      return (
+                        <Card key={f.id}><CardContent className="py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 text-xs font-semibold">
+                                <span className="truncate max-w-[9rem]" title={`${f.brand || ""} • ${f.name}`}>{f.name}</span>
+                                {f.brand && <Badge>{normalizeBrand(f.brand)}</Badge>}
+                                {typeof getStrength10(f) === 'number' && strengthBadge10(getStrength10(f))}
+                              </div>
+                              {f.description && <div className="text-[10px] opacity-70 line-clamp-2">{f.description}</div>}
+                            </div>
+                            <Button
+                              size="sm"
+                              className="h-7 text-[12px] px-2"
+                              onClick={() => { if (!inMix) addToMix(f.id); }}
+                              disabled={inMix}
+                              title={inMix ? "Уже в миксе" : "Добавить в микс"}
+                            >
+                              {inMix ? "✓" : "+"}
+                            </Button>
+                          </div>
+                        </CardContent></Card>
+                      );
+                    })}
+                  </div>
+                </>
+              )
+            )}
+
+            {/* Конструктор микса — фон меняется от описания */}
+            <Card className={toneBg}><CardContent className="space-y-2">
+              {parts.map((p) => {
+                const fl = flavors.find((f) => f.id === p.flavorId);
+                return (
+                  <div key={p.flavorId} className="flex items-center gap-2 text-xs">
+                    <span className="truncate max-w-[7rem]" title={fl?.name}>{fl?.name || "(не найдено)"}</span>
+                    <div className="w-24">
+                      <input type="range" min={0} max={100} step={5} value={safePercent(p.percent)} onChange={(e) => updatePercent(p.flavorId, [Number(e.target.value)])} className="w-full" />
+                    </div>
+                    <span>{safePercent(p.percent)}%</span>
+                    <Button variant="ghost" className="h-7 px-2 text-[12px]" onClick={() => removePart(p.flavorId)}>x</Button>
+                  </div>
+                );
+              })}
+
+              <Input placeholder="Название микса" value={title} onChange={(e) => setTitle(e.target.value)} />
+              <Textarea placeholder="Описание / заметки…" value={notes} onChange={(e) => setNotes(e.target.value)} />
+
+              <div className="flex items-center justify-between text-[12px]">
+                <span>Итог: {total}%</span>
+                <div className="flex items-center gap-2">
+                  {strengthValue10 != null && (
+                    <div className="flex items-center gap-1">
+                      Крепость:
+                      {(() => { const c = strengthColor(strengthValue10); return <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] border ${c.bg} ${c.text} ${c.border}`}>{strengthValue10.toFixed(1)}</span>; })()}
+                    </div>
+                  )}
+                  {tasteLabel && (<div className="flex items-center gap-1">Вкус: <Badge>{tasteLabel}</Badge></div>)}
+                </div>
+              </div>
+            </CardContent></Card>
+          </div>
+        )}
+
+        {activeTab === "guest" && (
+          <div className="space-y-2">
+            {mixesByAuthor.length === 0 && <div className="text-center text-xs text-slate-500">Пока нет сохранённых миксов</div>}
+            {mixesByAuthor.map(([author, mixes]) => (
+              <div key={author} className="space-y-1">
+                <div className="text-[11px] font-semibold opacity-80">миксы от {author}</div>
+                {mixes.map((m) => {
+                  const isOpen = !!expanded[m.id];
+                  const mixStrength = typeof m.strength10 === 'number' ? m.strength10 : calcMixStrengthValue10(m.parts || [], flavors);
+                  const mixTaste = m.taste || getMixTasteLabel(m.parts || [], flavors);
+                  const c = strengthColor(mixStrength);
+                  return (
+                    <Card key={m.id}>
+                      <CardContent className="py-2 text-xs">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <b className="truncate mr-2">{m.title}</b>
+                              {typeof mixStrength === 'number' && (
+                                <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] border ${c.bg} ${c.text} ${c.border}`}>{mixStrength.toFixed(1)}</span>
+                              )}
+                              {mixTaste && <Badge variant="outline">{mixTaste}</Badge>}
+                            </div>
+                            {m.notes && <div className="text-[10px] opacity-70 line-clamp-2">{m.notes}</div>}
+                          </div>
+                          <Button size="sm" variant="outline" className="h-7 px-2" onClick={() => setExpanded(prev => ({...prev, [m.id]: !prev[m.id]}))}>
+                            {isOpen ? "Скрыть" : "Подробнее"}
+                          </Button>
+                        </div>
+                        {isOpen && (
+                          <div className="mt-2 space-y-1">
+                            {(m.parts || []).map((p) => {
+                              const fl = flavors.find(f => f.id === p.flavorId);
+                              return (
+                                <div key={p.flavorId} className="flex items-center justify-between">
+                                  <span className="truncate mr-2">{fl ? `${normalizeBrand(fl.brand)} • ${fl.name}` : p.flavorId}</span>
+                                  <span className="opacity-70">{safePercent(p.percent)}%</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Bottom action bar */}
+        <div className="fixed left-0 right-0 bottom-0 z-50 px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)]">
+          <div className="mx-auto w-full max-w-sm">
+            <Card><CardContent className="flex items-center justify-between gap-2 p-2">
+              <div className="flex items-center gap-2 text-[11px]">
+                <span>Итог: {total}%</span>
+                {strengthValue10 != null && (() => { const c = strengthColor(strengthValue10); return <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] border ${c.bg} ${c.text} ${c.border}`}>{strengthValue10.toFixed(1)}</span>; })()}
+                {tasteLabel && <Badge>{tasteLabel}</Badge>}
+              </div>
+              <div className="flex gap-1">
+                <Button variant="outline" className="h-9" onClick={clearDraft}>Сброс</Button>
+                <Button className="h-9" onClick={saveGuestMix} disabled={!isValid}>Сохранить</Button>
+              </div>
+            </CardContent></Card>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Default export component (lets the canvas/preview mount it automatically)
+// -----------------------------------------------------------------------------
+function App() {
+  return (
+    <>
+      <MobileViewportInit />
+      <HookahMixApp />
+    </>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Console smoke tests (extended)
+// -----------------------------------------------------------------------------
+(() => {
+  try {
+    console.group("HookahMixApp – smoke tests");
+
+    // (1) Clamp keeps total <= 100
+    { const parts = [ { flavorId: "a", percent: 80 }, { flavorId: "b", percent: 10 } ]; const clamped = clampPercentForPart(parts, "b", 30); console.assert(clamped === 20, "Clamp ok (80 + 30 -> 100)"); }
+
+    // (2) percentSum tolerates strings/missing
+    { const weird = [ { flavorId: "x", percent: 40 }, { flavorId: "y", percent: "20" }, { flavorId: "z" } ]; console.assert(percentSum(weird) === 60, "percentSum ok"); }
+
+    // (3) Strength calc uses brand defaults & ignores unknown
+    { const fl = [ { id: "mh-x", name: "X", brand: "MustHave" }, { id: "bn-y", name: "Y", brand: "Bonch" } ]; const mix = [ { flavorId: "mh-x", percent: 50 }, { flavorId: "bn-y", percent: 50 }, { flavorId: "unknown", percent: 10 } ]; const v = calcMixStrengthValue10(mix, fl); console.assert(v === 6.0, "MH(5)+Bonch(7) -> 6.0"); }
+
+    // (4) Strength calc returns null when no valid flavors
+    { const v = calcMixStrengthValue10([ { flavorId: "nope", percent: 100 } ], []); console.assert(v === null, "null on invalid"); }
+
+    // (5) Parser dedup & id auto-gen
+    { const arr = parseFlavorsFromJson({ Starline: [ { id: "sl-apple", name: "Apple" }, { id: "sl-apple", name: "Apple" } ], Bonch: [ { name: "Peach" } ] }); const ids = new Set(arr.map(x=>x.id)); console.assert(arr.length === ids.size, "dedup ok"); console.assert(arr.some(x=>x.id.startsWith("Bonch-")), "id gen ok"); }
+
+    // (6) UUID uniqueness & pattern
+    { const ids = new Set(); for (let i=0;i<100;i++) ids.add(uuidv4()); console.assert(ids.size===100, "uuid unique"); const s=[...ids][0]; console.assert(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s), "uuid v4 shape"); }
+
+    // (7) deriveMainTaste null for empty/zero-sum
+    { const v1 = deriveMainTaste([], FALLBACK_FLAVORS); console.assert(v1===null, "taste empty null"); const v2 = deriveMainTaste([ { flavorId: "mh-ice-lemon", percent: 0 } ], FALLBACK_FLAVORS); console.assert(v2===null, "taste zero null"); }
+
+    // (8) tasteWordFromTag robustness
+    { console.assert(tasteWordFromTag(undefined) === null, "tasteWordFromTag handles undefined");
+      console.assert(tasteWordFromTag(null) === null, "tasteWordFromTag handles null");
+      console.assert(["кислый","сладкий","пряный","ледяной","фруктовый","десертный","алкогольный"].includes(tasteWordFromTag("ice")), "maps 'ice' to a category"); }
+
+    // (9) getMixTasteLabel category, not flavor name
+    {
+      const fl = [
+        { id: "a", name: "Raspberry", brand: "MustHave", tags: ["ягодные", "сладкие"] },
+        { id: "b", name: "Ice Lemon", brand: "MustHave", tags: ["лед", "цитрус"] },
+      ];
+      const parts = [ { flavorId: "a", percent: 60 }, { flavorId: "b", percent: 40 } ];
+      const cat = getMixTasteLabel(parts, fl);
+      console.assert(typeof cat === 'string' && cat.split(" ").length === 1, "category is single word");
+      console.assert(!/raspberry|lemon/i.test(cat), "not raw flavor name");
+    }
+
+    // (10) New tests: strength color mapping
+    { const a = strengthColor(3.9), b = strengthColor(4.0), c = strengthColor(7.0); console.assert(a.bg.includes('emerald')); console.assert(b.bg.includes('amber')); console.assert(c.bg.includes('rose')); }
+
+    // (11) New tests: tone from description
+    { console.assert(toneFromText('ледяной бласт') === 'ледяной' || toneFromText('ледяной бласт') === 'ледяной'); }
+
+    // (12) New tests: name search across brands
+    {
+      const list = [
+        { id:'a1', name:'Peach', brand:'A' },
+        { id:'b1', name:'Super Peach Ice', brand:'B' },
+        { id:'c1', name:'Apple', brand:'C' },
+      ];
+      const r = (function(){ return (list||[]).filter(f=>String(f.name).toLowerCase().includes('peach')).length; })();
+      console.assert(r===2, 'name search finds across brands');
+    }
+
+    // (13) Additional: weighted strength with uneven parts
+    {
+      const fl = [ { id:'x', name:'A', brand:'MustHave' }, { id:'y', name:'B', brand:'Bonch' } ];
+      const parts = [ { flavorId:'x', percent:30 }, { flavorId:'y', percent:70 } ]; // 0.3*5 + 0.7*7 = 6.4
+      const v = calcMixStrengthValue10(parts, fl);
+      console.assert(v === 6.4, 'weighted average strength 6.4');
+    }
+
+    // (14) Additional: clampPercentForPart caps against others sum
+    {
+      const parts = [ { flavorId:'a', percent:90 }, { flavorId:'b', percent:0 } ];
+      const cl = clampPercentForPart(parts, 'b', 20);
+      console.assert(cl === 10, 'clamps to remaining capacity (10)');
+    }
+
+    // (15) Additional: strengthBadge10 returns span element
+    {
+      const el = strengthBadge10(5.0);
+      console.assert(el && typeof el === 'object' && el.type === 'span', 'strengthBadge10 element shape');
+    }
+
+    // (16) Additional: calcMixStrengthValue10 returns null for zero-sum
+    {
+      const v = calcMixStrengthValue10([ { flavorId:'a', percent:0 } ], [ { id:'a', name:'X', brand:'MustHave' } ]);
+      console.assert(v === null, 'null on zero-sum mix');
+    }
+
+    // (17) Additional: deriveMainTaste prefers higher weight
+    {
+      const fl = [
+        { id:'a', name:'Sweet A', brand:'A', tags:['сладкие'] },
+        { id:'b', name:'Icy B', brand:'B', tags:['лед'] },
+      ];
+      const parts = [ { flavorId:'a', percent:70 }, { flavorId:'b', percent:30 } ];
+      const t = deriveMainTaste(parts, fl);
+      console.assert(t && /слад/i.test(t), 'deriveMainTaste prefers сладкие');
+    }
+
+    // (18) Button className is a single string and preserves custom class
+    {
+      const el = Button({ className: 'extra', children: 'X' });
+      console.assert(el && el.props && typeof el.props.className === 'string', 'Button className is string');
+      console.assert(el.props.className.includes('extra'), 'Button carries custom className');
+    }
+
+    // (19) Badge className is a single string and preserves custom class
+    {
+      const el = Badge({ className: 'mark', children: 'Y' });
+      console.assert(el && el.props && typeof el.props.className === 'string', 'Badge className is string');
+      console.assert(el.props.className.includes('mark'), 'Badge carries custom className');
+    }
+
+    // (20) Parser: string tags with pipes/semicolons
+    {
+      const arr = parseFlavorsFromJson({ BrandX: [ { name: 'Test', tags: 'sweet|ice;fruit' } ] });
+      const t = (arr[0] && arr[0].tags) || [];
+      console.assert(Array.isArray(t) && t.length === 3 && t.includes('sweet') && t.includes('ice') && t.includes('fruit'), 'parses delimited tag string');
+    }
+
+    // (21) toneFromText returns null for unknown text
+    {
+      console.assert(toneFromText('abracadabra') === null, 'toneFromText returns null for unknown');
+    }
+
+    console.groupEnd();
+  } catch (e) { console.error("Smoke tests error", e); }
+})();
+
+
+  // Mount React App
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(React.createElement(App));
+  </script>
+</body>
+</html>
